@@ -1,5 +1,4 @@
 from playwright.sync_api import sync_playwright
-import time
 import config
 
 def execute_plan(plan):
@@ -37,7 +36,19 @@ def execute_plan(plan):
             
             elif action == "hover":
                 element.hover()
+
+            elif action == "enter":
+                page.keyboard.press("Enter")
+
+            elif action == "clear":
+                element.clear()
             
+            elif action == "wait":
+                page.wait_for_timeout(2000)
+
+            elif action == "back":
+                page.go_back()
+
             print("Success.")
             return True
 

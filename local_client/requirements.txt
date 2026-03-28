@@ -1,5 +1,2 @@
-requests
 playwright
-keyboard
-pydantic
-google-cloud-aiplatform
+google-cloud-aiplatform[reasoning_engines,preview]
