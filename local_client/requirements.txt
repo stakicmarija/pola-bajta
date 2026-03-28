@@ -4,3 +4,4 @@ PyQt6
 numpy
 sounddevice
 soundfile
+pynput

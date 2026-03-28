@@ -2,7 +2,7 @@ import sys
 import threading
 import queue
 import config
-from playwright.sync_api import connect_over_cdp
+from playwright.sync_api import sync_playwright
 from pynput import keyboard as pkb
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
@@ -56,12 +56,15 @@ def on_dialog_done(dialog):
 
     if confirm_dlg.confirmed:
         print("User confirmed!")
-        with connect_over_cdp(config.CHROME_URL) as browser:
-            context = browser.contexts[0].pages[0]
-            dom_snapshot = get_current_dom(context)
-            plan = get_execution_plan(response["text"], dom_snapshot, context.url)
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp(config.CHROME_URL)
+            page = browser.contexts[0].pages[0]
+            dom_snapshot = get_current_dom(page)
+            print(dom_snapshot)
+            plan = get_execution_plan(response["text"], dom_snapshot, page.url)
             print(plan)
-            execute_plan(plan, context)
+            execute_plan(plan, page)
+
 
     else:
         print("User rejected.")
