@@ -1,25 +1,24 @@
+# deploy.py
 import vertexai
 from vertexai.preview import reasoning_engines
-from agent import AccessibilityOrchestrator # Import your orchestrated class
+from agent import AccessibilityOrchestrator # This now points to your class above
 
-# 1. Initialize your personal Google Cloud Project
 vertexai.init(
-    project="your-personal-project-id",
+    project="glass-core-461803-v7",
     location="us-central1",
-    staging_bucket="gs://your-gcs-bucket-name" # Create a standard Cloud Storage bucket first
+    staging_bucket="gs://my-hackathon-code-123" # <--- Update this!
 )
 
 print("Packaging agents and deploying to Vertex AI...")
 
-# 2. The Deployment Command
+# This command "bundles" your agent.py and agents/ folder
 remote_app = reasoning_engines.ReasoningEngine.create(
-    AccessibilityOrchestrator(),
+    AccessibilityOrchestrator(), # This instantiates your class
     display_name="Parkinsons_Accessibility_Agent",
-    description="Multi-agent ADK pipeline for UI translation",
     requirements=[
         "google-adk",
         "pydantic",
-        "google-cloud-aiplatform"
+        "google-cloud-aiplatform[reasoning_engines,preview]"
     ]
 )
 
