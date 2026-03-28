@@ -1,8 +1,35 @@
-*/.env*
-*/.venv*
-*/env*
-*/venv*
+# --- Virtual Environments ---
+venv/
+.venv/
+env/
+.env/
+[Vv]env/
+[Ee]nv/
+python-venv/
 
+# --- Python Cache & Compiled Files ---
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+
+# --- Environment Variables (Secrets) ---
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# --- IDE & OS Files ---
+.vscode/
+.idea/
 .DS_Store
+Thumbs.db
+
+# --- Playwright & Build ---
+dist/
+build/
+node_modules/
+playwright-report/
+test-results/
