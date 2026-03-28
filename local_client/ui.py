@@ -2,7 +2,7 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QLabel, QLineEdit, QApplication
 )
 from PyQt6.QtCore import Qt
-
+from .recorder import AudioRecorder
 
 class InputOverlay(QDialog):
     def __init__(self, mode="text"):
@@ -53,12 +53,15 @@ class InputOverlay(QDialog):
         layout.addWidget(self.input_field)
 
     def _build_voice(self, layout):
-        label = QLabel("🎤  Listening...")
-        label.setStyleSheet("color: #ffffff; font-size: 28px;")
-        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(label)
+        self._recorder = AudioRecorder()
+        self._recorder.start()  # start recording immediately when overlay opens
 
-        hint = QLabel("ESC to cancel")
+        self.voice_label = QLabel("🎤  Listening...")
+        self.voice_label.setStyleSheet("color: #ff6b6b; font-size: 28px;")
+        self.voice_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.voice_label)
+
+        hint = QLabel("ENTER to confirm   ·   ESC to cancel")
         hint.setStyleSheet("color: #555555; font-size: 11px;")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(hint)
@@ -71,11 +74,25 @@ class InputOverlay(QDialog):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
+            if self.mode == "voice" and hasattr(self, "_recorder"):
+                self._recorder.stop()
             self.result = None
             self.reject()
+
+        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self.mode == "voice" and hasattr(self, "_recorder"):
+                audio_path = self._recorder.stop()
+                self.result = audio_path  # returns path to .wav file
+                self.accept()
 
     def _center(self):
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - self.width()) // 2
         y = (screen.height() - self.height()) // 2 - 80
         self.move(x, y)
+
+    def closeEvent(self, event):
+        """Called whenever dialog closes — stop recorder if running."""
+        if self.mode == "voice" and hasattr(self, "_recorder"):
+            self._recorder.stop()  # stop mic, discard audio
+        event.accept()
