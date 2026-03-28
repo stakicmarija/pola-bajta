@@ -1,2 +1,6 @@
 playwright
 google-cloud-aiplatform[reasoning_engines,preview]
+PyQt6
+numpy
+sounddevice
+soundfile

@@ -1,10 +1,15 @@
 import sys
 import threading
 import queue
+import config
+from playwright.sync_api import connect_over_cdp
 from pynput import keyboard as pkb
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
-from local_client.ui import InputOverlay
+from local_client.ui import InputOverlay, ConfirmationOverlay
+from local_client.api_caller import get_translation_voice, get_translation_text, get_execution_plan
+from local_client.dom_parser import get_current_dom
+from local_client.executor import execute_plan
 
 
 events = queue.Queue()
@@ -34,12 +39,33 @@ def hotkey_worker():
 
 
 def on_dialog_done(dialog):
-    """Called when dialog closes."""
     global _active_dialog
-    if dialog.result:
-        print(f"User entered: {dialog.result}")
+
+    if not dialog.result:
+        _active_dialog = None
+        return
+
+    if dialog.mode == "voice":
+        response = get_translation_voice(dialog.result)
     else:
-        print("Cancelled.")
+        response = get_translation_text(dialog.result)
+
+    # show Agent 1 response to user
+    confirm_dlg = ConfirmationOverlay(response["text"])
+    confirm_dlg.exec()
+
+    if confirm_dlg.confirmed:
+        print("User confirmed!")
+        with connect_over_cdp(config.CHROME_URL) as browser:
+            context = browser.contexts[0].pages[0]
+            dom_snapshot = get_current_dom(context)
+            plan = get_execution_plan(response["text"], dom_snapshot, context.url)
+            print(plan)
+            execute_plan(plan, context)
+
+    else:
+        print("User rejected.")
+
     _active_dialog = None
 
 
