@@ -2,26 +2,30 @@ from __future__ import annotations
 
 import json
 import importlib
+from pathlib import Path
 import re
 from typing import Any
 
 GenerationConfig: Any | None = None
 GenerativeModel: Any | None = None
+Part: Any | None = None
 
 
 def _ensure_vertex_classes() -> None:
 	"""Load Vertex SDK classes lazily to keep local dev environment optional."""
-	global GenerationConfig, GenerativeModel
-	if GenerationConfig is not None and GenerativeModel is not None:
+	global GenerationConfig, GenerativeModel, Part
+	if GenerationConfig is not None and GenerativeModel is not None and Part is not None:
 		return
 
 	try:
 		module = importlib.import_module("vertexai.generative_models")
 		GenerationConfig = getattr(module, "GenerationConfig", None)
 		GenerativeModel = getattr(module, "GenerativeModel", None)
+		Part = getattr(module, "Part", None)
 	except Exception:
 		GenerationConfig = None
 		GenerativeModel = None
+		Part = None
 
 
 SYSTEM_PROMPT = """
@@ -40,7 +44,7 @@ Rules:
 
 
 class VoiceFilterAgent:
-	"""Black-box text cleaner for voice-transcribed input."""
+	"""Black-box cleaner for transcribed text or raw voice audio."""
 
 	def __init__(
 		self,
@@ -62,8 +66,10 @@ class VoiceFilterAgent:
 				system_instruction=SYSTEM_PROMPT,
 			)
 
-	def __call__(self, raw_text: str) -> str:
-		return self.filter_text(raw_text)
+	def __call__(self, raw_input: str | bytes) -> str:
+		if isinstance(raw_input, bytes):
+			return self.filter_audio_bytes(raw_input)
+		return self.filter_text(raw_input)
 
 	def filter_text(self, raw_text: str) -> str:
 		"""Return cleaned text only. Never raises for runtime generation failures."""
@@ -92,6 +98,38 @@ class VoiceFilterAgent:
 			return cleaned or self._fallback_clean(source)
 		except Exception:
 			return self._fallback_clean(source)
+
+	def filter_audio_file(self, audio_file_path: str, mime_type: str = "audio/wav") -> str:
+		"""Transcribe and clean a voice recording from a local file path."""
+		try:
+			audio_bytes = Path(audio_file_path).read_bytes()
+		except Exception:
+			return ""
+		return self.filter_audio_bytes(audio_bytes, mime_type=mime_type)
+
+	def filter_audio_bytes(self, audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
+		"""Transcribe + clean voice audio bytes. Returns empty string on runtime failure."""
+		if not audio_bytes or self._model is None or Part is None:
+			return ""
+
+		try:
+			audio_part = Part.from_data(data=audio_bytes, mime_type=mime_type)
+			prompt = (
+				"Transcribe this speech and clean disfluency. Return only final cleaned text "
+				"with no JSON or labels."
+			)
+
+			kwargs: dict[str, Any] = {}
+			if GenerationConfig is not None:
+				kwargs["generation_config"] = GenerationConfig(
+					temperature=self.temperature,
+					max_output_tokens=self.max_output_tokens,
+				)
+
+			response = self._model.generate_content([prompt, audio_part], **kwargs)
+			return self._normalize_output(self._extract_text(response))
+		except Exception:
+			return ""
 
 	@staticmethod
 	def _extract_text(response: Any) -> str:
