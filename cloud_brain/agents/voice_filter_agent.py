@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import json
 import importlib
+import json
+import logging
 from pathlib import Path
-import re
 from typing import Any
+
+from pydantic import BaseModel, Field, ValidationError
+
+log = logging.getLogger(__name__)
 
 GenerationConfig: Any | None = None
 GenerativeModel: Any | None = None
@@ -12,192 +16,129 @@ Part: Any | None = None
 
 
 def _ensure_vertex_classes() -> None:
-	"""Load Vertex SDK classes lazily to keep local dev environment optional."""
-	global GenerationConfig, GenerativeModel, Part
-	if GenerationConfig is not None and GenerativeModel is not None and Part is not None:
-		return
+    global GenerationConfig, GenerativeModel, Part
+    if GenerationConfig is not None and GenerativeModel is not None and Part is not None:
+        return
 
-	try:
-		module = importlib.import_module("vertexai.generative_models")
-		GenerationConfig = getattr(module, "GenerationConfig", None)
-		GenerativeModel = getattr(module, "GenerativeModel", None)
-		Part = getattr(module, "Part", None)
-	except Exception:
-		GenerationConfig = None
-		GenerativeModel = None
-		Part = None
+    try:
+        module = importlib.import_module("vertexai.generative_models")
+        GenerationConfig = getattr(module, "GenerationConfig", None)
+        GenerativeModel = getattr(module, "GenerativeModel", None)
+        Part = getattr(module, "Part", None)
+    except Exception as e:
+        log.error("Error loading Vertex SDK classes: %s", e)
+        GenerationConfig = None
+        GenerativeModel = None
+        Part = None
 
 
-SYSTEM_PROMPT = """
-You are VoiceFilterAgent for an accessibility pipeline.
+class VoiceTranscriptionResponse(BaseModel):
+    corrected_text: str = Field(
+        ...,
+        description="The transcribed and cleaned sentence from the audio input.",
+    )
 
-Task:
-- Input is noisy speech-to-text with fillers, repetition, false starts, and disfluency.
-- Rewrite into clear, concise text while preserving user intent and meaning.
 
-Rules:
-- Remove filler words and repeated fragments when they do not change meaning.
-- Do not add new facts, commands, or assumptions.
-- Keep the same language as the input.
-- Return ONLY the cleaned text, with no JSON, markdown, labels, or explanation.
+AUDIO_SYSTEM_PROMPT = """
+You are VoiceFilterAgent for an accessibility system.
+
+Your goal is to transcribe the provided audio and produce a clean, accurate sentence.
+
+Instructions:
+- Transcribe the spoken content accurately.
+- Remove filler words (um, uh, like, you know) and repetitions.
+- Fix obvious errors and produce a grammatically correct sentence.
+- Preserve the speaker's original intent.
+
+Return ONLY a JSON object with one field:
+- "corrected_text": the cleaned transcription
 """.strip()
 
 
 class VoiceFilterAgent:
-	"""Black-box cleaner for transcribed text or raw voice audio."""
+    """LLM-based transcription and cleanup for WAV audio input."""
 
-	def __init__(
-		self,
-		model_name: str = "gemini-2.5-flash",
-		temperature: float = 0.0,
-		max_output_tokens: int = 256,
-		model: Any | None = None,
-	) -> None:
-		_ensure_vertex_classes()
+    def __init__(
+        self,
+        model_name: str = "gemini-2.5-flash",
+        temperature: float = 0.0,
+        max_output_tokens: int = 256,
+        model: Any | None = None,
+    ) -> None:
+        _ensure_vertex_classes()
 
-		self.model_name = model_name
-		self.temperature = temperature
-		self.max_output_tokens = max_output_tokens
-		self._model = model
+        self.model_name = model_name
+        self.temperature = temperature
+        self.max_output_tokens = max_output_tokens
 
-		if self._model is None and GenerativeModel is not None:
-			self._model = GenerativeModel(
-				model_name=self.model_name,
-				system_instruction=SYSTEM_PROMPT,
-			)
+        self._audio_model = model
 
-	def __call__(self, raw_input: str | bytes) -> str:
-		if isinstance(raw_input, bytes):
-			return self.filter_audio_bytes(raw_input)
-		return self.filter_text(raw_input)
+        if GenerativeModel is not None and self._audio_model is None:
+            self._audio_model = GenerativeModel(
+                model_name=self.model_name,
+                system_instruction=AUDIO_SYSTEM_PROMPT,
+            )
 
-	def filter_text(self, raw_text: str) -> str:
-		"""Return cleaned text only. Never raises for runtime generation failures."""
-		source = (raw_text or "").strip()
-		if not source:
-			return ""
+    def _build_generation_config(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {}
+        if GenerationConfig is not None:
+            kwargs["generation_config"] = GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+                response_mime_type="application/json",
+            )
+        return kwargs
 
-		if self._model is None:
-			return self._fallback_clean(source)
+    def filter_audio_bytes(self, audio_bytes: bytes, mime_type: str = "audio/wav") -> VoiceTranscriptionResponse | None:
+        if not audio_bytes:
+            log.warning("Empty audio bytes provided.")
+            return None
 
-		prompt = (
-			"Clean this voice-transcribed input. Return only cleaned text:\n\n"
-			f"{source}"
-		)
+        if self._audio_model is None or Part is None:
+            log.warning("Audio model or Part unavailable, returning None.")
+            return None
 
-		try:
-			kwargs: dict[str, Any] = {}
-			if GenerationConfig is not None:
-				kwargs["generation_config"] = GenerationConfig(
-					temperature=self.temperature,
-					max_output_tokens=self.max_output_tokens,
-				)
+        try:
+            audio_part = Part.from_data(data=audio_bytes, mime_type=mime_type)
+            response = self._audio_model.generate_content(audio_part, **self._build_generation_config())
+            raw_json = self._extract_text(response).strip()
 
-			response = self._model.generate_content(prompt, **kwargs)
-			cleaned = self._normalize_output(self._extract_text(response))
-			return cleaned or self._fallback_clean(source)
-		except Exception:
-			return self._fallback_clean(source)
+            if not raw_json:
+                log.warning("Empty response from model for audio input.")
+                return None
 
-	def filter_audio_file(self, audio_file_path: str, mime_type: str = "audio/wav") -> str:
-		"""Transcribe and clean a voice recording from a local file path."""
-		try:
-			audio_bytes = Path(audio_file_path).read_bytes()
-		except Exception:
-			return ""
-		return self.filter_audio_bytes(audio_bytes, mime_type=mime_type)
+            parsed = json.loads(raw_json)
+            return VoiceTranscriptionResponse.model_validate(parsed)
 
-	def filter_audio_bytes(self, audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
-		"""Transcribe + clean voice audio bytes. Returns empty string on runtime failure."""
-		if not audio_bytes or self._model is None or Part is None:
-			return ""
+        except json.JSONDecodeError as e:
+            log.error("Failed to parse model JSON response for audio: %s", e)
+            return None
+        except ValidationError as e:
+            log.error("Audio response failed Pydantic validation: %s", e)
+            return None
+        except Exception as e:
+            log.error("Unexpected error in filter_audio_bytes: %s", e)
+            return None
 
-		try:
-			audio_part = Part.from_data(data=audio_bytes, mime_type=mime_type)
-			prompt = (
-				"Transcribe this speech and clean disfluency. Return only final cleaned text "
-				"with no JSON or labels."
-			)
+    @staticmethod
+    def _extract_text(response: Any) -> str:
+        if response is None:
+            return ""
 
-			kwargs: dict[str, Any] = {}
-			if GenerationConfig is not None:
-				kwargs["generation_config"] = GenerationConfig(
-					temperature=self.temperature,
-					max_output_tokens=self.max_output_tokens,
-				)
+        direct = getattr(response, "text", None)
+        if isinstance(direct, str):
+            return direct
 
-			response = self._model.generate_content([prompt, audio_part], **kwargs)
-			return self._normalize_output(self._extract_text(response))
-		except Exception:
-			return ""
+        candidates = getattr(response, "candidates", None)
+        if not candidates:
+            return ""
 
-	@staticmethod
-	def _extract_text(response: Any) -> str:
-		if response is None:
-			return ""
+        first = candidates[0]
+        content = getattr(first, "content", None)
+        parts = getattr(content, "parts", None)
+        if not parts:
+            return ""
 
-		direct = getattr(response, "text", None)
-		if isinstance(direct, str):
-			return direct
-
-		candidates = getattr(response, "candidates", None)
-		if not candidates:
-			return ""
-
-		first = candidates[0]
-		content = getattr(first, "content", None)
-		parts = getattr(content, "parts", None)
-		if not parts:
-			return ""
-
-		texts: list[str] = []
-		for part in parts:
-			piece = getattr(part, "text", None)
-			if isinstance(piece, str):
-				texts.append(piece)
-		return "\n".join(texts).strip()
-
-	@staticmethod
-	def _normalize_output(text: str) -> str:
-		cleaned = (text or "").strip()
-		if not cleaned:
-			return ""
-
-		cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
-		cleaned = re.sub(r"\s*```$", "", cleaned).strip()
-
-		if cleaned.startswith("{") and cleaned.endswith("}"):
-			try:
-				payload = json.loads(cleaned)
-				for key in ("cleaned_text", "text", "output", "result"):
-					value = payload.get(key)
-					if isinstance(value, str):
-						cleaned = value.strip()
-						break
-			except Exception:
-				pass
-
-		if len(cleaned) >= 2 and cleaned[0] == cleaned[-1] and cleaned[0] in {'"', "'"}:
-			cleaned = cleaned[1:-1].strip()
-
-		cleaned = re.sub(r"\s+", " ", cleaned).strip()
-		return cleaned
-
-	@staticmethod
-	def _fallback_clean(text: str) -> str:
-		"""Conservative fallback if model is unavailable or fails."""
-		cleaned = text
-		fillers_pattern = (
-			r"\b(um+|uh+|erm|ah+|like|you know|i mean|sort of|kind of|basically|actually)\b"
-		)
-		cleaned = re.sub(fillers_pattern, " ", cleaned, flags=re.IGNORECASE)
-		cleaned = re.sub(r"\b(\w+)(\s+\1\b)+", r"\1", cleaned, flags=re.IGNORECASE)
-		cleaned = re.sub(r"\s+", " ", cleaned).strip()
-		cleaned = re.sub(r"\s+([,.!?])", r"\1", cleaned)
-		return cleaned
-
-
-if __name__ == "__main__":
-	agent = VoiceFilterAgent(model=None)
-	sample = "um can you like open open the settings uh page please"
-	print(agent.filter_text(sample))
+        return "\n".join(
+            p.text for p in parts if isinstance(getattr(p, "text", None), str)
+        ).strip()
