@@ -4,7 +4,8 @@ import queue
 from pynput import keyboard as pkb
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication
-from ui import InputOverlay
+from local_client.ui import InputOverlay
+
 
 events = queue.Queue()
 _pressed = set()
