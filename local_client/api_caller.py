@@ -5,6 +5,12 @@ import json
 
 vertexai.init(project=config.PROJECT_ID, location=config.LOCATION)
 
+def get_translation_voice(wav_file):
+    return {"text":"radi"}
+
+def get_translation_text(input):
+    return {"text":"radi"}
+
 def get_execution_plan(user_text, dom_snapshot):
     try:
         remote_app = reasoning_engines.ReasoningEngine(config.RESOURCE_NAME)
