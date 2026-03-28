@@ -1,0 +1,1 @@
+# Takes intended action and DOM content and outputs next action

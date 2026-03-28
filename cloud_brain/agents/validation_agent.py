@@ -1,0 +1,1 @@
+# Scrapes DOM after every action and sees if everything is how it should be, if command was executed
