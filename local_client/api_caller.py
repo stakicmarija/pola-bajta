@@ -11,12 +11,13 @@ def get_translation_voice(wav_file):
 def get_translation_text(input):
     return {"text":"radi"}
 
-def get_execution_plan(user_text, dom_snapshot):
+def get_execution_plan(user_text, dom_snapshot,current_url):
     try:
         remote_app = reasoning_engines.ReasoningEngine(config.RESOURCE_NAME)
         response = remote_app.query(
             user_input=user_text,
-            dom_context=json.dumps(dom_snapshot)
+            dom_context=json.dumps(dom_snapshot),
+            current_url=current_url
         )
         return response
     except Exception as e:
