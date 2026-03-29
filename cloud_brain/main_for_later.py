@@ -241,120 +241,122 @@ def get_active_page():
 
 def on_dialog_done(dialog):
     """The Core Brain logic triggered when the user finishes typing/speaking."""
-    global _active_dialog  # CRITICAL: Access the global state to reset it
-
-    # 1. Exit fast and reset if the user cancelled the dialog
     if not dialog.result:
-        _active_dialog = None
         return
 
-    # 2. Wrap everything in try/finally to ensure the hotkey "unlocks"
+    # 1. SYNC: Always grab the current tab
+    page = get_active_page()
+    if not page:
+        print("❌ Error: No active browser page found.")
+        return
+
+    print(f"\n{'=' * 20} STARTING AGENT {'=' * 20}")
+    print(f"📡 Page: {page.url[:50]}...")
+    print(f"⌨️ Raw Input: '{dialog.result}'")
+
+    # 2. REFINEMENT (Tremor Filter)
     try:
-        # SYNC: Always grab the current tab
-        page = get_active_page()
-        if not page:
-            return
+        response = get_translation_text(dialog.result)
+        # Use .get() with a fallback to the original messy text if API fails
+        clean_goal = response.get("corrected_text", dialog.result)
+    except Exception as e:
+        print(f"⚠️ Tremor API Error: {e}")
+        clean_goal = dialog.result
 
-        print(f"\n{'=' * 20} STARTING AGENT {'=' * 20}")
-        print(f"📡 Page: {page.url[:50]}...")
-        print(f"⌨️ Raw Input: '{dialog.result}'")
+    print(f"✅ Refined Goal: '{clean_goal}'\n")
 
-        # REFINEMENT (Tremor Filter)
+    # 3. AUTONOMOUS LOOP
+    step_count = 0
+    max_steps = 10
+
+    while step_count < max_steps:
+        step_count += 1
+        print(f"--- 🔄 Cycle #{step_count} ---")
+
+        # Wait for page stability so we don't get an empty DOM
         try:
-            response = get_translation_text(dialog.result)
-            clean_goal = response.get("corrected_text", dialog.result)
+            page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except:
+            pass
+
+        dom_snapshot = get_current_dom(page)
+        print(f"📸 Snapshot: {len(dom_snapshot)} elements found.")
+
+        # A. Request Plan from Cloud
+        try:
+            plan = get_execution_plan(clean_goal, dom_snapshot, page.url)
+            print(f"🧠 Plan: {plan}")
         except Exception as e:
-            print(f"⚠️ Tremor API Error: {e}")
-            clean_goal = dialog.result
+            print(f"❌ Planner Error: {e}")
+            break
 
-        print(f"✅ Refined Goal: '{clean_goal}'\n")
+        if not plan:
+            break
 
-        # AUTONOMOUS LOOP
-        step_count = 0
-        max_steps = 10
+        # B. Check for Termination
+        if plan.get("done") and (not plan.get("action") or plan.get("action") == "wait"):
+            print("🏁 Mission accomplished.")
+            break
 
-        while step_count < max_steps:
-            step_count += 1
-            print(f"--- 🔄 Cycle #{step_count} ---")
+        # --- FIX: TRANSLATE ID TO HUMAN TEXT ---
+        action = plan.get('action', 'wait')
+        raw_id = plan.get('selected_id', 'N/A')
 
-            # Wait for page stability
+        # Determine the friendly name for the UI
+        target_label = f"ID {raw_id}"
+        if raw_id != 'N/A':
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=5000)
+                # Clean the ID (handles 1.0 vs 1)
+                clean_target_id = int(float(raw_id))
+                # Look for this ID in our snapshot list
+                for el in dom_snapshot:
+                    if el.get('id') == clean_target_id:
+                        # Grab text, placeholder, or role to describe it
+                        element_text = el.get('text', '').strip() or el.get('role', '')
+                        if element_text:
+                            target_label = f"'{element_text}'"
+                        break
+            except (ValueError, TypeError):
+                pass
+
+        # C. PROPOSE ACTION (Human Readable)
+        proposal_msg = f"AI wants to: {action.upper()} on {target_label}\nProceed?"
+        confirm = ConfirmationOverlay(proposal_msg)
+
+        # Trigger a "pre-action" flash in the browser so the user sees what's being discussed
+        # Note: Ensure execute_plan has a sub-function or logic to highlight the element
+        if raw_id != 'N/A':
+            # We call a small script to highlight the element BEFORE the dialog blocks execution
+            try:
+                selector = f'[data-ai-id="{int(float(raw_id))}"]'
+                page.evaluate(f"""(sel) => {{
+                    const el = document.querySelector(sel);
+                    if (el) {{
+                        el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
+                        el.style.outline = '5px solid #FF3B30';
+                        el.style.boxShadow = '0 0 20px #FF3B30';
+                        setTimeout(() => {{ el.style.outline = ''; el.style.boxShadow = ''; }}, 2000);
+                    }}
+                }}""", selector)
             except:
                 pass
 
-            dom_snapshot = get_current_dom(page)
-            print(f"📸 Snapshot: {len(dom_snapshot)} elements found.")
+        confirm.exec()  # This blocks until user clicks
 
-            # A. Request Plan from Cloud
-            try:
-                plan = get_execution_plan(clean_goal, dom_snapshot, page.url)
-                print(f"🧠 Plan: {plan}")
-            except Exception as e:
+        if confirm.confirmed:
+            print(f"🚀 Executing {action}...")
+            execute_plan(plan, page)
+
+            if plan.get("done"):
+                print("🏁 Final action completed.")
                 break
 
-            if not plan:
-                break
+            page.wait_for_timeout(1000)
+        else:
+            print("🛑 User aborted sequence.")
+            break
 
-            # B. Check for Termination
-            if plan.get("done") and (not plan.get("action") or plan.get("action") == "wait"):
-                print("🏁 Mission accomplished.")
-                break
-
-            # TRANSLATE ID TO HUMAN TEXT
-            action = plan.get('action', 'wait')
-            raw_id = plan.get('selected_id', 'N/A')
-
-            target_label = f"ID {raw_id}"
-            if raw_id != 'N/A':
-                try:
-                    clean_target_id = int(float(raw_id))
-                    for el in dom_snapshot:
-                        if el.get('id') == clean_target_id:
-                            element_text = el.get('text', '').strip() or el.get('role', '')
-                            if element_text:
-                                target_label = f"'{element_text}'"
-                            break
-
-                    # Pre-action flash for visual confirmation
-                    selector = f'[data-ai-id="{clean_target_id}"]'
-                    page.evaluate(f"""(sel) => {{
-                        const el = document.querySelector(sel);
-                        if (el) {{
-                            el.scrollIntoView({{behavior: 'smooth', block: 'center'}});
-                            el.style.outline = '5px solid #FF3B30';
-                            el.style.boxShadow = '0 0 20px #FF3B30';
-                            setTimeout(() => {{ el.style.outline = ''; el.style.boxShadow = ''; }}, 2000);
-                        }}
-                    }}""", selector)
-                except:
-                    pass
-
-            # C. PROPOSE ACTION
-            proposal_msg = f"AI wants to: {action.upper()} on {target_label}\nProceed?"
-            confirm = ConfirmationOverlay(proposal_msg)
-            confirm.exec()  # Blocks until user clicks
-
-            if confirm.confirmed:
-                print(f"🚀 Executing {action}...")
-                execute_plan(plan, page)
-
-                if plan.get("done"):
-                    print("🏁 Final action completed.")
-                    break
-
-                page.wait_for_timeout(1000)
-            else:
-                print("🛑 User aborted sequence.")
-                break
-
-    except Exception as e:
-        print(f"🔥 CRITICAL AGENT ERROR: {e}")
-    finally:
-        # --- THE FIX: ALWAYS RESET STATE ---
-        print(f"\n{'=' * 20} AGENT FINISHED {'=' * 20}")
-        print("Ready for next command (Ctrl+Space)...")
-        _active_dialog = None
+    print(f"{'=' * 50}\n")
 
 
 def process_events():
@@ -378,30 +380,32 @@ def main():
     global _playwright, _browser
 
     app = QApplication(sys.argv)
-    api_caller.init_engine()
 
+    print("🧠 Booting Cloud Brain...")
+    api_caller.init_engine()
+    if api_caller._remote_app is None:
+        print("❌ Connection Failed. Check internet/credentials.")
+        return
+
+    print("🌐 Connecting to Chrome Debugger...")
     try:
-        print("🌐 Connecting to Chrome...")
         _playwright = sync_playwright().start()
+        # Connect to your script-launched Chrome
         _browser = _playwright.chromium.connect_over_cdp(config.CHROME_URL)
 
-        # Start background thread
+        # Start input listeners
         threading.Thread(target=hotkey_worker, daemon=True).start()
 
-        # UI Polling
+        # UI Event Loop Link
         timer = QTimer()
         timer.timeout.connect(process_events)
         timer.start(50)
 
-        print("🚀 SYSTEM READY (Ctrl+Space)")
-
-        # This is the main loop. If an error happens in on_dialog_done,
-        # we catch it THERE so it doesn't break THIS loop.
+        print("🚀 SYSTEM READY (Ctrl+Space for Text, Alt+Space for Voice)")
         sys.exit(app.exec())
 
     except Exception as e:
-        print(f"❌ CRITICAL SYSTEM FAILURE: {e}")
-        # If it crashes here, the whole script actually stops.
+        print(f"❌ Startup Error: {e}")
     finally:
         if _playwright:
             _playwright.stop()

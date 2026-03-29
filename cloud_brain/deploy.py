@@ -1,25 +1,32 @@
-# deploy.py
 import vertexai
 from vertexai.preview import reasoning_engines
-from agent import AccessibilityOrchestrator # This now points to your class above
+# Use a relative import or ensure the class is picked up correctly
+import agent
 
 vertexai.init(
-    project="glass-core-461803-v7",
+    project="polabajta",
     location="us-central1",
-    staging_bucket="gs://my-hackathon-code-123" # <--- Update this!
+    staging_bucket="gs://polabajta"
 )
 
-print("Packaging agents and deploying to Vertex AI...")
+print("📦 Packaging REAL agent with local context...")
 
-# This command "bundles" your agent.py and agents/ folder
+# Define the instance from the imported module
+orchestrator = agent.AccessibilityOrchestrator()
+
 remote_app = reasoning_engines.ReasoningEngine.create(
-    AccessibilityOrchestrator(), # This instantiates your class
-    display_name="Parkinsons_Accessibility_Agent",
+    orchestrator,
     requirements=[
-        "google-adk",
-        "pydantic",
-        "google-cloud-aiplatform[reasoning_engines,preview]"
-    ]
+        "google-cloud-aiplatform[reasoningengine]",
+        "cloudpickle==3.0.0",
+        "google-cloud-storage",
+        "langchain",
+        "langchain-google-vertexai",
+    ],
+    # ⬇️ THIS IS THE CRITICAL CHANGE ⬇️
+    # We include 'agent.py' directly so the cloud can 'find' the module
+    extra_packages=["agents", "agent.py"],
+    display_name="Accessibility_Orchestrator_Prod"
 )
 
-print(f"Deployment Complete! Your Agent ID is: {remote_app.resource_name}")
+print(f"✅ DEPLOYMENT SUCCESSFUL! ID: {remote_app.resource_name}")

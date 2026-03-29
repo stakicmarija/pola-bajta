@@ -1,5 +1,4 @@
-import config
-
+from . import config
 def get_current_dom(page):
     js_script = f"""
     () => {{

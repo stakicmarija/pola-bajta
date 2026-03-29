@@ -1,159 +1,106 @@
-from __future__ import annotations
-
-import importlib
 import json
 import logging
-from typing import Any
-
-from pydantic import BaseModel, Field, ValidationError
+import traceback  # Added for detailed error reporting
+from typing import Any, Optional, Dict
+from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
-GenerationConfig: Any | None = None
-GenerativeModel: Any | None = None
-
-
-def _ensure_vertex_classes() -> None:
-    global GenerationConfig, GenerativeModel
-    if GenerationConfig is not None and GenerativeModel is not None:
-        return
-    try:
-        module = importlib.import_module("vertexai.generative_models")
-        GenerationConfig = getattr(module, "GenerationConfig", None)
-        GenerativeModel = getattr(module, "GenerativeModel", None)
-    except Exception as e:
-        log.error("Error loading Vertex SDK classes: %s", e)
-        GenerationConfig = None
-        GenerativeModel = None
-
-
-# --- Pydantic response model ---
 
 class TremorFilterResponse(BaseModel):
-    corrected_text: str = Field(
-        ...,
-        description="The grammatically correct, cleaned sentence.",
-    )
-
-
-SYSTEM_PROMPT = """
-You are TremorFilterAgent for an accessibility system.
-
-Your goal is to reconstruct the most likely intended sentence from noisy, tremor-affected input.
-
-The input may contain:
-- misspellings
-- repeated letters
-- missing spaces
-- broken or partial words
-- accidental characters
-
-Instructions:
-- Convert the input into a clear, grammatically correct sentence.
-- Correct obvious misspellings and keyboard errors.
-- Normalize repeated letters into standard spelling (e.g. "pleaaaase" → "please").
-- Merge or split words when necessary.
-- Infer the most likely intended words when confidence is high.
-
-Important constraints:
-- Do NOT invent new meaning or change the user's intent.
-- If multiple interpretations are possible, choose the most common and practical one.
-- Prefer simple, common words over rare ones.
-- Do not add extra information beyond what the user likely intended.
-
-Return ONLY a JSON object with one field:
-- "corrected_text": the cleaned sentence
-""".strip()
+    corrected_text: str = Field(..., description="The cleaned sentence.")
 
 
 class TremorFilterAgent:
-    """LLM-based intent reconstruction for tremor-affected typed input."""
-
     def __init__(
-        self,
-        model_name: str = "gemini-2.5-flash",
-        temperature: float = 0.0,
-        max_output_tokens: int = 256,
-        model: Any | None = None,
+            self,
+            model_name: str = "gemini-2.5-flash",
+            temperature: float = 0.4,
+            max_output_tokens: int = 1024,
     ) -> None:
-        _ensure_vertex_classes()
-
         self.model_name = model_name
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
-        self._model = model
+        self._model = None
 
-        if self._model is None and GenerativeModel is not None:
+        self.system_prompt = """
+        CONTEXT:
+        You are the core Denoising Engine for an assistive technology suite. The user has a physical tremor.
+
+        YOUR MISSION:
+        Transform "noisy" keyboard input into the single most likely intended command or sentence. 
+
+        RULES:
+        1. DE-DUPLICATION: Remove repeated characters.
+        2. OUTPUT FORMAT: Return ONLY a valid JSON object with key "corrected_text".
+
+        EXAMPLES:
+        - Input: "ooopppennn gmmaiiil"
+          Output: {"corrected_text": "open gmail"}
+        """.strip()
+
+    @property
+    def model(self):
+        if self._model is None:
+            # Using a more explicit initialization for Reasoning Engine stability
+            from vertexai.generative_models import GenerativeModel, Content, Part
+            sys_instr = Content(role="system", parts=[Part.from_text(self.system_prompt)])
+
             self._model = GenerativeModel(
                 model_name=self.model_name,
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=sys_instr,
             )
+        return self._model
 
-    def __call__(self, raw_text: str) -> TremorFilterResponse | None:
+    def __call__(self, raw_text: str) -> Optional[Dict[str, Any]]:
         return self.filter_text(raw_text)
 
-    def filter_text(self, raw_text: str) -> TremorFilterResponse | None:
-        """
-        Returns a validated TremorFilterResponse, or None if the model is unavailable.
-        Callers should fall back to raw_text if None is returned.
-        """
+    def filter_text(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        from vertexai.generative_models import GenerationConfig
+        print(f"DEBUG: Starting filter_text for input: {raw_text}", flush=True)
+
         source = (raw_text or "").strip()
         if not source:
-            return TremorFilterResponse(corrected_text="")
-
-        if self._model is None:
-            log.warning("Model unavailable, returning None.")
-            return None
+            return {"corrected_text": ""}
 
         try:
-            kwargs: dict[str, Any] = {}
-            if GenerationConfig is not None:
-                kwargs["generation_config"] = GenerationConfig(
-                    temperature=self.temperature,
-                    max_output_tokens=self.max_output_tokens,
-                    response_mime_type="application/json",  # Forces JSON output
-                )
+            gen_config = GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+                response_mime_type="application/json",
+            )
 
-            response = self._model.generate_content(source, **kwargs)
-            raw_json = self._extract_text(response).strip()
+            print(f"DEBUG: Calling Gemini model...", flush=True)
+            response = self.model.generate_content(source, generation_config=gen_config)
 
-            if not raw_json:
-                log.warning("Empty response from model.")
-                return None
+            full_response_text = response.text.strip()
+            print(f"DEBUG: Raw Model Output: \n{full_response_text}\n", flush=True)
 
-            parsed = json.loads(raw_json)
-            return TremorFilterResponse.model_validate(parsed)
+            # Find the first '{' and the last '}'
+            start_idx = full_response_text.find('{')
+            end_idx = full_response_text.rfind('}') + 1
 
-        except json.JSONDecodeError as e:
-            log.error("Failed to parse model JSON response: %s", e)
-            return None
-        except ValidationError as e:
-            log.error("Response failed Pydantic validation: %s", e)
-            return None
+            if start_idx == -1 or end_idx == 0:
+                return {"corrected_text": source}
+
+            clean_json_str = full_response_text[start_idx:end_idx]
+
+            # 3. Parsing the cleaned string
+            parsed = json.loads(clean_json_str)
+
+            # 4. Validation
+            validated = TremorFilterResponse.model_validate(parsed)
+            result = validated.model_dump()
+            print(f"DEBUG: Validated Result: {result}", flush=True)
+
+            return result
+
         except Exception as e:
-            log.error("Unexpected error in filter_text: %s", e)
-            return None
+            error_detail = traceback.format_exc()
+            log.error(f"Tremor Agent Error: {error_detail}")
 
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        if response is None:
-            return ""
-
-        direct = getattr(response, "text", None)
-        if isinstance(direct, str):
-            return direct
-
-        candidates = getattr(response, "candidates", None)
-        if not candidates:
-            return ""
-
-        first = candidates[0]
-        content = getattr(first, "content", None)
-        parts = getattr(content, "parts", None)
-        if not parts:
-            return ""
-
-        return "\n".join(
-            p.text for p in parts if isinstance(getattr(p, "text", None), str)
-        ).strip()
-
+            return {
+                "corrected_text": f"AGENT_CRASH: {str(e)}",
+                "debug_info": error_detail[:200],
+                "raw_response_captured": response.text if 'response' in locals() else "None"
+            }

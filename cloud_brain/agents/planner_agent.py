@@ -1,30 +1,10 @@
-# Takes intended action and DOM content and outputs next actionfrom __future__ import annotations
-
-import importlib
 import json
 import logging
-from typing import Any, Literal
-
+import base64
+from typing import Any, List, Dict, Optional, Literal
 from pydantic import BaseModel, ValidationError, model_validator
 
 log = logging.getLogger(__name__)
-
-GenerationConfig: Any | None = None
-GenerativeModel: Any | None = None
-
-
-def _ensure_vertex_classes() -> None:
-    global GenerationConfig, GenerativeModel
-    if GenerationConfig is not None and GenerativeModel is not None:
-        return
-    try:
-        module = importlib.import_module("vertexai.generative_models")
-        GenerationConfig = getattr(module, "GenerationConfig", None)
-        GenerativeModel = getattr(module, "GenerativeModel", None)
-    except Exception as e:
-        log.error("Error loading Vertex SDK classes: %s", e)
-        GenerationConfig = None
-        GenerativeModel = None
 
 
 class InteractiveElement(BaseModel):
@@ -34,182 +14,144 @@ class InteractiveElement(BaseModel):
     role: str
 
 
-ActionType = Literal["click", "type", "scroll", "wait", "hover", "enter", "back", "clear"]
-ELEMENT_TARGETING_ACTIONS: tuple[ActionType, ...] = ("click", "type", "scroll", "hover", "enter", "clear")
-
-
 class Action(BaseModel):
-    action: ActionType
-    selected_id: int | None = None
-    text_to_type: str | None = None
+    action: str
+    # Use -1 instead of None. Vertex AI ONLY wants a pure 'integer' type.
+    selected_id: int = -1
+    text_to_type: str = ""
     done: bool
 
     @model_validator(mode="after")
-    def check_fields(self) -> Action:
-        if self.action in ELEMENT_TARGETING_ACTIONS:
-            if self.selected_id is None:
+    def check_fields(self) -> "Action":
+        targeting = ("click", "type", "scroll", "hover", "enter", "clear")
+        if self.action in targeting:
+            # Check for our sentinel -1 instead of None
+            if self.selected_id == -1:
                 raise ValueError(f"'selected_id' is required for '{self.action}'.")
-        elif self.selected_id is not None:
-            raise ValueError(f"'selected_id' must be omitted for '{self.action}'.")
-
-        if self.action == "type" and self.text_to_type is None:
-            raise ValueError("'text_to_type' is required for type (use '' if empty).")
-        if self.action != "type" and self.text_to_type is not None:
-            raise ValueError("'text_to_type' must be omitted unless action is 'type'.")
         return self
-
-SYSTEM_PROMPT = """
-You are DOMActionAgent for a browser accessibility extension.
-
-You receive:
-1. USER INTENT — a clean sentence of what the user wants to do.
-2. CURRENT URL — the page the user is currently on.
-3. INTERACTIVE ELEMENTS — a JSON array of interactive elements on the current page.
-   Each element has: id (integer), tag, text, role.
-
-Return the single best next action to take right now.
-
-## Action types
-
-"click"    → selected_id required
-"type"     → selected_id + text_to_type required (use "" if nothing to type yet)
-"scroll"   → selected_id required
-"hover"    → selected_id required
-"enter"    → selected_id required
-"clear"    → selected_id required
-"wait"     → no extra fields needed
-"back"     → no extra fields needed
-
-## Rules
-- Return exactly ONE action — the most logical immediate next step.
-- Use only these actions: click, type, scroll, wait, hover, enter, back, clear.
-- Use "wait" if you need to observe page changes before deciding the next step.
-- Use "back" only when the best next move is returning to the previous page/state.
-- Set done: true if this action fully completes the intent, false if more steps follow.
-""".strip()
 
 
 class DOMActionAgent:
-
     def __init__(
-        self,
-        model_name: str = "gemini-2.5-flash",
-        temperature: float = 0.0,
-        max_output_tokens: int = 256,
-        model: Any | None = None,
+            self,
+            model_name: str = "gemini-2.5-flash",
+            temperature: float = 0.4,
+            max_output_tokens: int = 65500,
     ) -> None:
-        _ensure_vertex_classes()
         self.model_name = model_name
         self.temperature = temperature
         self.max_output_tokens = max_output_tokens
-        self._model = model
+        self._model = None
         self._response_schema = Action.model_json_schema()
+        # Put the prompt inside the class so it's never lost
+        self.system_prompt = """You are DOMActionAgent, a strategic browser controller for accessibility.
+        You receive a USER INTENT (which includes the PREVIOUS STEP taken) and the current DOM state.
 
-        if self._model is None and GenerativeModel is not None:
+        ### STRATEGY RULES
+        1. MEMORY AWARENESS: Look at the 'PREVIOUS STEP' in the intent. 
+           - If you just 'type' text and the textbox is now filled, DO NOT type again. 
+           - Instead, use 'enter' on that ID or 'click' the search/submit button.
+        2. SEARCH LOGIC: A 'search' intent is only 'done: true' when results are visible. 
+           - Sequence: type -> enter (or click search button) -> wait/verify.
+        3. EMAILING: For 'write email' intents, generate high-quality, professional body text.
+        4. NAVIGATION: If the intent is to 'Open [X]' and you click a link to [X], you may set 'done: true'.
+
+        ### ACTION TYPES
+        - "click"  (selected_id): For buttons and links.
+        - "type"   (selected_id, text_to_type): For input. (Set done: false if you need to submit next).
+        - "enter"  (selected_id): Press Enter on an element (Best for submitting searches).
+        - "scroll" (selected_id): Bring element into view.
+        - "hover"  (selected_id): Reveal hidden menus.
+        - "clear"  (selected_id): Wipe existing text.
+        - "wait": Use if the page is still loading.
+        - "back": Go to previous page.
+
+        ### CONSTRAINTS
+        - Return exactly ONE action.
+        - selected_id MUST be a raw integer (no floats like 1.0).
+        - reasoning: Provide a 1-sentence explanation of why this step is next.
+        - Set 'done: true' ONLY when the final goal is reached or the final submission is fired."""
+
+    @property
+    def model(self):
+        if self._model is None:
+            from vertexai.generative_models import GenerativeModel
             self._model = GenerativeModel(
                 model_name=self.model_name,
-                system_instruction=SYSTEM_PROMPT,
+                system_instruction=self.system_prompt,
             )
+        return self._model
 
     def __call__(
-        self,
-        corrected_text: str,
-        elements: list[dict[str, Any]],
-        current_url: str = "",
-    ) -> Action | None:
+            self,
+            corrected_text: str,
+            elements: List[Dict[str, Any]],
+            current_url: str = "",
+    ) -> Optional[Dict[str, Any]]:
         return self.next_action(corrected_text, elements, current_url)
 
     def next_action(
-        self,
-        corrected_text: str,
-        elements: list[dict[str, Any]],
-        current_url: str = "",
-    ) -> Action | None:
+            self,
+            corrected_text: str,
+            elements: List[Dict[str, Any]],
+            current_url: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        import traceback # Added for debugging
+        from vertexai.generative_models import GenerationConfig
+
         intent = (corrected_text or "").strip()
-
         if not intent or not elements:
-            log.warning("Empty intent or elements.")
+            print("DEBUG: Missing intent or elements, returning None", flush=True)
             return None
 
         try:
+            # 1. Validate inputs
             validated_elements = [InteractiveElement.model_validate(e) for e in elements]
-        except ValidationError as e:
-            log.error("Invalid elements input: %s", e)
-            return None
 
-        if self._model is None:
-            log.warning("Model unavailable.")
-            return None
-
-        try:
-            kwargs: dict[str, Any] = {}
-            if GenerationConfig is not None:
-                kwargs["generation_config"] = GenerationConfig(
-                    temperature=self.temperature,
-                    max_output_tokens=self.max_output_tokens,
-                    response_mime_type="application/json",
-                    response_schema=self._response_schema,  # ← Pydantic drives the format
-                )
-
-            response = self._model.generate_content(
-                self._build_prompt(intent, validated_elements, current_url),
-                **kwargs,
+            # 2. Setup Generation Config
+            gen_config = GenerationConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+                response_mime_type="application/json",
+                response_schema=self._response_schema,
             )
-            raw_json = self._extract_text(response).strip()
 
-            if not raw_json:
-                log.warning("Empty response from model.")
-                return None
+            # 3. Call Gemini
+            print(f"DEBUG: Calling Planner for intent: {intent}", flush=True)
+            response = self.model.generate_content(
+                self._build_prompt(intent, validated_elements, current_url),
+                generation_config=gen_config,
+            )
 
-            action = Action.model_validate(json.loads(raw_json))
+            full_response_text = response.text.strip()
+            print(f"DEBUG: Raw Planner Output: \n{full_response_text}\n", flush=True)
 
-            if action.selected_id is not None:
-                valid_ids = {e.id for e in validated_elements}
-                if action.selected_id not in valid_ids:
-                    log.error("Model returned unknown element id %d.", action.selected_id)
-                    return None
+            # Find the JSON block
+            start_idx = full_response_text.find('{')
+            end_idx = full_response_text.rfind('}') + 1
 
-            return action
+            if start_idx == -1 or end_idx == 0:
+                raise ValueError(f"No JSON block found in response: {full_response_text}")
 
-        except json.JSONDecodeError as e:
-            log.error("Failed to parse JSON response: %s", e)
-            return None
-        except ValidationError as e:
-            log.error("Response failed Pydantic validation: %s", e)
-            return None
+            clean_json_str = full_response_text[start_idx:end_idx]
+
+            parsed_data = json.loads(clean_json_str)
+            validated_action = Action.model_validate(parsed_data)
+
+            result = validated_action.model_dump()
+            print(f"DEBUG: Validated Action: {result}", flush=True)
+            return result
+
         except Exception as e:
-            log.error("Unexpected error: %s", e)
-            return None
+            error_detail = traceback.format_exc()
+            log.error(f"Cloud Agent Error: {error_detail}")
+            # Returning error info so your Mac terminal shows the problem
+            return {
+                "error": str(e),
+                "done": True,
+                "debug_info": error_detail[:200]
+            }
 
-    @staticmethod
-    def _build_prompt(
-        intent: str,
-        elements: list[InteractiveElement],
-        current_url: str,
-    ) -> str:
-        url_line = f"CURRENT URL:\n{current_url}\n\n" if current_url else ""
-        return (
-            f"USER INTENT:\n{intent}\n\n"
-            f"{url_line}"
-            f"INTERACTIVE ELEMENTS:\n"
-            f"{json.dumps([e.model_dump() for e in elements], ensure_ascii=False, indent=2)}"
-        )
-
-    @staticmethod
-    def _extract_text(response: Any) -> str:
-        if response is None:
-            return ""
-        direct = getattr(response, "text", None)
-        if isinstance(direct, str):
-            return direct
-        candidates = getattr(response, "candidates", None)
-        if not candidates:
-            return ""
-        content = getattr(candidates[0], "content", None)
-        parts = getattr(content, "parts", None)
-        if not parts:
-            return ""
-        return "\n".join(
-            p.text for p in parts if isinstance(getattr(p, "text", None), str)
-        ).strip()
+    def _build_prompt(self, intent, elements, url):
+        return f"USER INTENT: {intent}\nURL: {url}\nELEMENTS: {json.dumps([e.model_dump() for e in elements])}"
 

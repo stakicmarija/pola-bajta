@@ -32,4 +32,4 @@ dist/
 build/
 node_modules/
 playwright-report/
-test-results/
+test-results/your_existing_key.json

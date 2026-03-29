@@ -1,11 +1,18 @@
-@echo off
-echo Starting Chrome, AI mode...
-start chrome.exe --remote-debugging-port=9222 --user-data-dir="C:\chrome_ai_temp"
+#!/bin/zsh
 
-echo Waiting for Chrome...
-timeout /t 3
+echo "[1/3] Starting Chrome in Debug Mode..."
+# Note: On Mac, we use the full path to the Chrome binary
+"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+  --remote-debugging-port=9222 \
+  --user-data-dir="$HOME/chrome_ai_temp" &
 
-echo Starting assistent...
-call venv\Scripts\activate.bat
-python main.py
-pause
+# Give Chrome a few seconds to open the debugging port
+echo "[2/3] Waiting for Chrome..."
+sleep 3
+
+# --- THE MAC VENV ACTIVATION ---
+echo "[3/3] Activating environment and starting Assistant..."
+source venv/bin/activate
+
+# Start your Python script
+python3 main.py
